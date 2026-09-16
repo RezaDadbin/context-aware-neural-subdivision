@@ -144,6 +144,3 @@ This work modifies and extends the released Neural Subdivision implementation
 and uses the linked Surface Multigrid subdivision/remeshing code. Upstream
 licenses are preserved in their respective directories. See
 `THIRD_PARTY_NOTICES.md` and `docs/changes_from_upstream.md`.
-
-Source files covered by Neural Subdivision's license remain under the Mozilla
-Public License 2.0; see `LICENSE`.
