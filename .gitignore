@@ -1,0 +1,59 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Private environment files
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# C/C++ build products
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.dylib
+*.so
+*_bin
+
+# Generated datasets and meshes
+external/neuralSubdiv/data_PKL/
+external/neuralSubdiv/data_meshes/
+data_candidates/**/*.obj
+*.pkl
+*.npy
+*.npz
+
+# Model jobs and checkpoints
+external/neuralSubdiv/jobs/
+*.pt
+*.pth
+*.ckpt
+*.dat
+*.onnx
+
+# Experiment outputs
+artifacts/
+logs/
+outputs/
+report 2/
+*.log
+
+# Generated C++ sample outputs
+external/surface_multigrid_code/09_random_subdiv_remesh/output_s*.obj
