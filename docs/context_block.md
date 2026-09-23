@@ -21,6 +21,20 @@ half-flap context. The predictors receive:
 The original `local2Global`, one-ring/edge pooling, connectivity, and output
 ordering are unchanged.
 
+## Adaptive Local Depth V1
+
+With `context_adaptive_local=true`, the six local-attention layers expose their
+cumulative outputs `H1...H6`. A small shared scorer produces one logit for each
+depth at every vertex, and a softmax mixture becomes the local representation
+sent to the unchanged global-attention stack. The scorer starts with uniform
+weights and is trained jointly from the subdivision reconstruction objective;
+it requires no radius labels.
+
+These outputs represent cumulative message-passing depth: `H6` can contain
+information relayed from zero through six edge steps. They are not six
+independent exact-ring branches. Evaluation supports learned, uniform, and
+fixed-depth interventions and can save the selector weights for analysis.
+
 ## Invariance
 
 The Context Block never consumes raw world-space XYZ as a feature. It uses
@@ -93,7 +107,8 @@ No dataset is selected in this codebase. Create a job only after choosing PKLs:
 ```bash
 python scripts/write_context_hyperparams.py EXPERIMENT_NAME \
   --train-pkl /path/to/train.pkl \
-  --valid-pkl /path/to/valid.pkl
+  --valid-pkl /path/to/valid.pkl \
+  --adaptive-local
 ./scripts/train_context.sh EXPERIMENT_NAME
 ```
 

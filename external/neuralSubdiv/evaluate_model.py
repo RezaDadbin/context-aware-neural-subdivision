@@ -15,6 +15,13 @@ from train_resume import NETPARAMS, torch_load
 from validate_dataset import require_valid_dataset
 
 
+CONTEXT_MODES = (
+    "context", "disabled", "shuffled", "uniform",
+    "fixed_1", "fixed_2", "fixed_3", "fixed_4",
+    "fixed_5", "fixed_6", "fixed_7", "fixed_8",
+)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("job", help="job folder containing hyperparameters.json")
@@ -23,13 +30,16 @@ def parse_args():
                         default="context")
     parser.add_argument("--checkpoint", help="override the job netparams.dat")
     parser.add_argument("--modes", nargs="+",
-                        choices=("context", "disabled", "shuffled"),
+                        choices=CONTEXT_MODES,
                         default=("context",))
     parser.add_argument("--device", choices=("cpu", "cuda", "mps"))
     parser.add_argument("--surface-samples", type=int, default=10000)
     parser.add_argument("--max-meshes", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output")
+    parser.add_argument(
+        "--selector-output",
+        help="optional compressed NPZ containing learned per-vertex weights")
     return parser.parse_args()
 
 
@@ -48,14 +58,23 @@ def fixed_rotation(dtype, device):
             torch.sin(angle) * cross)
 
 
-def run_model(model, dataset, mesh_index, model_type, mode):
+def selector_mode(mode):
+    if mode == "uniform" or mode.startswith("fixed_"):
+        return mode
+    return "learned"
+
+
+def run_model(model, dataset, mesh_index, model_type, mode,
+              return_selector_weights=False):
     inputs = dataset.getInputData(mesh_index)
     if model_type == "phase0":
         return model(inputs, mesh_index, dataset.hfList,
                      dataset.poolMats, dataset.dofs)
     return model(
         inputs, mesh_index, dataset.hfList, dataset.poolMats, dataset.dofs,
-        context_enabled=mode != "disabled", shuffle_context=mode == "shuffled")
+        context_enabled=mode != "disabled", shuffle_context=mode == "shuffled",
+        local_context_mode=selector_mode(mode),
+        return_selector_weights=return_selector_weights)
 
 
 def rotation_errors(model, dataset, mesh_index, model_type, mode, reference):
@@ -72,7 +91,8 @@ def rotation_errors(model, dataset, mesh_index, model_type, mode, reference):
         moved = model(
             inputs, mesh_index, dataset.hfList, dataset.poolMats, dataset.dofs,
             context_enabled=mode != "disabled",
-            shuffle_context=mode == "shuffled")
+            shuffle_context=mode == "shuffled",
+            local_context_mode=selector_mode(mode))
     errors = []
     for original, transformed in zip(reference, moved):
         restored = (transformed - translation).mm(rotation)
@@ -101,6 +121,59 @@ def aggregate(records):
         key: {name: float(np.mean(values)) for name, values in metrics.items()}
         for key, metrics in by_mode_level.items()
     }
+
+
+def selector_metrics(weights):
+    scale_count = weights.size(1)
+    radii = torch.arange(
+        1, scale_count + 1, dtype=weights.dtype, device=weights.device)
+    effective_radius = (weights * radii.unsqueeze(0)).sum(dim=1)
+    safe_weights = weights.clamp_min(1e-12)
+    entropy = -(safe_weights * safe_weights.log()).sum(dim=1)
+    if scale_count > 1:
+        entropy = entropy / np.log(float(scale_count))
+    dominant = torch.argmax(weights, dim=1)
+    fractions = torch.bincount(
+        dominant, minlength=scale_count).to(weights.dtype) / weights.size(0)
+    return {
+        "vertices": int(weights.size(0)),
+        "mean_weights": weights.mean(dim=0).cpu().tolist(),
+        "std_weights": weights.std(dim=0, unbiased=False).cpu().tolist(),
+        "mean_effective_radius": float(effective_radius.mean().cpu()),
+        "std_effective_radius": float(
+            effective_radius.std(unbiased=False).cpu()),
+        "mean_normalized_entropy": float(entropy.mean().cpu()),
+        "dominant_radius_fractions": fractions.cpu().tolist(),
+    }
+
+
+def aggregate_selector(records):
+    grouped = {}
+    for record in records:
+        key = "%s_stage_%d" % (record["mode"], record["stage"])
+        grouped.setdefault(key, []).append(record["metrics"])
+
+    result = {}
+    for key, values in grouped.items():
+        result[key] = {
+            "meshes": len(values),
+            "vertices_per_mesh_mean": float(np.mean([
+                value["vertices"] for value in values])),
+            "mean_weights": np.mean([
+                value["mean_weights"] for value in values], axis=0).tolist(),
+            "mean_weight_std_within_mesh": np.mean([
+                value["std_weights"] for value in values], axis=0).tolist(),
+            "mean_effective_radius": float(np.mean([
+                value["mean_effective_radius"] for value in values])),
+            "mean_effective_radius_std_within_mesh": float(np.mean([
+                value["std_effective_radius"] for value in values])),
+            "mean_normalized_entropy": float(np.mean([
+                value["mean_normalized_entropy"] for value in values])),
+            "dominant_radius_fractions": np.mean([
+                value["dominant_radius_fractions"] for value in values],
+                axis=0).tolist(),
+        }
+    return result
 
 
 def main():
@@ -132,13 +205,33 @@ def main():
         dataset.nM, args.max_meshes)
     records = []
     rotations = []
+    selector_records = []
+    selector_arrays = {}
     with torch.no_grad():
         for mode_index, mode in enumerate(modes):
             for mesh_index in range(count):
                 mode_seed = args.seed + mode_index * 100000 + mesh_index
                 torch.manual_seed(mode_seed)
-                outputs = run_model(
-                    model, dataset, mesh_index, args.model, mode)
+                collect_selector = (
+                    args.model == "context" and mode != "disabled" and
+                    model.context_block.adaptive_local)
+                result = run_model(
+                    model, dataset, mesh_index, args.model, mode,
+                    return_selector_weights=collect_selector)
+                if collect_selector:
+                    outputs, selector_history = result
+                    for stage, weights in enumerate(selector_history):
+                        if args.selector_output and mode == "context":
+                            key = "mesh_%03d_stage_%d" % (mesh_index, stage)
+                            selector_arrays[key] = weights.cpu().numpy()
+                        selector_records.append({
+                            "mode": mode,
+                            "mesh": mesh_index,
+                            "stage": stage,
+                            "metrics": selector_metrics(weights),
+                        })
+                else:
+                    outputs = result
                 target_all = dataset.meshes[mesh_index][params["numSubd"]].V
                 for level, output in enumerate(outputs):
                     target = target_all[:output.size(0)]
@@ -171,13 +264,21 @@ def main():
         "meshes_evaluated": count,
         "surface_samples_per_mesh": args.surface_samples,
         "aggregate": aggregate(records),
+        "selector_aggregate": aggregate_selector(selector_records),
+        "selector_weights_file": (
+            os.path.abspath(args.selector_output)
+            if args.selector_output else None),
         "rotation_equivariance": rotations,
+        "selector_records": selector_records,
         "records": records,
     }
     output = args.output or os.path.join(job, "evaluation.json")
     with open(output, "w") as handle:
         json.dump(report, handle, indent=2, allow_nan=False)
         handle.write("\n")
+    if args.selector_output:
+        np.savez_compressed(args.selector_output, **selector_arrays)
+        print("selector weights: %s" % args.selector_output)
     print("evaluated %d meshes in modes: %s" % (count, ", ".join(modes)))
     print("report: %s" % output)
 

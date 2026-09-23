@@ -21,6 +21,10 @@ def main():
     parser.add_argument("--local-layers", type=int, default=6)
     parser.add_argument("--global-layers", type=int, default=2)
     parser.add_argument("--global-chunk-size", type=int, default=256)
+    parser.add_argument(
+        "--adaptive-local", action="store_true",
+        help="learn a soft per-vertex mixture of cumulative local depths")
+    parser.add_argument("--selector-hidden-dim", type=int, default=16)
     parser.add_argument("--core-checkpoint")
     args = parser.parse_args()
 
@@ -30,6 +34,10 @@ def main():
         parser.error("attention layer counts must be non-negative")
     if args.global_chunk_size < 0:
         parser.error("global chunk size must be non-negative")
+    if args.adaptive_local and args.local_layers < 1:
+        parser.error("adaptive local context requires local layers")
+    if args.selector_hidden_dim < 1:
+        parser.error("selector hidden dimension must be positive")
 
     root = Path(__file__).resolve().parents[1]
     neural = root / "external" / "neuralSubdiv"
@@ -60,6 +68,8 @@ def main():
         "context_dropout": 0.0,
         "context_global_chunk_size": args.global_chunk_size,
         "context_geometry_eps": 1e-8,
+        "context_adaptive_local": args.adaptive_local,
+        "context_selector_hidden_dim": args.selector_hidden_dim,
     }
     if args.core_checkpoint:
         data["core_checkpoint"] = str(

@@ -25,6 +25,10 @@ Context and subdivision parameters are optimized jointly. Connectivity,
 canonical local frames, local-to-global conversion, aggregation, and vertex
 ordering remain part of the original subdivision core.
 
+An optional Adaptive V1 selector learns a soft per-vertex mixture of the
+cumulative outputs from the six local-attention layers. Enable it with
+`--adaptive-local`; the fixed final-depth model remains the default.
+
 ## Repository Layout
 
 ```text
@@ -104,7 +108,8 @@ Create one context job explicitly:
 ```bash
 python3 scripts/write_context_hyperparams.py EXPERIMENT_NAME \
   --train-pkl /path/to/train.pkl \
-  --valid-pkl /path/to/valid.pkl
+  --valid-pkl /path/to/valid.pkl \
+  --adaptive-local
 ./scripts/train_context.sh EXPERIMENT_NAME
 ```
 
@@ -124,7 +129,9 @@ Evaluate a context-conditioned checkpoint:
 ```bash
 cd external/neuralSubdiv
 python3 evaluate_model.py /path/to/job /path/to/held_out.pkl \
-  --model context --modes context disabled shuffled
+  --model context \
+  --modes context disabled shuffled uniform fixed_1 fixed_6 \
+  --selector-output /path/to/selector_weights.npz
 ```
 
 The intervention modes test whether the trained model depends on correctly

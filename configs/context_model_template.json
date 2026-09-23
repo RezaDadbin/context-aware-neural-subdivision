@@ -21,5 +21,7 @@
   "context_feed_forward_dim": 128,
   "context_dropout": 0.0,
   "context_global_chunk_size": 256,
-  "context_geometry_eps": 1e-8
+  "context_geometry_eps": 1e-8,
+  "context_adaptive_local": false,
+  "context_selector_hidden_dim": 16
 }
