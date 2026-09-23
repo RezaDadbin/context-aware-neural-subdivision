@@ -157,6 +157,69 @@ class ContextModelTests(unittest.TestCase):
         torch.testing.assert_close(
             expected[permutation], actual, rtol=2e-5, atol=2e-5)
 
+    def test_adaptive_selector_is_permutation_equivariant(self):
+        torch.manual_seed(10)
+        params = dict(self.params, context_adaptive_local=True)
+        model = ContextSubdNet(params).eval()
+        positions = self.inputs[:, :3]
+        half_flaps = self.half_flaps[0][0]
+        permutation = torch.tensor([3, 5, 1, 0, 4, 2])
+        inverse = torch.empty_like(permutation)
+        inverse[permutation] = torch.arange(permutation.numel())
+
+        with torch.no_grad():
+            expected, expected_weights = model.context_block(
+                positions, half_flaps, return_scale_weights=True)
+            actual, actual_weights = model.context_block(
+                positions[permutation], inverse[half_flaps],
+                return_scale_weights=True)
+        torch.testing.assert_close(
+            expected[permutation], actual, rtol=2e-5, atol=2e-5)
+        torch.testing.assert_close(
+            expected_weights[permutation], actual_weights,
+            rtol=2e-5, atol=2e-5)
+
+    def test_adaptive_selector_starts_uniform_and_supports_fixed_depths(self):
+        torch.manual_seed(12)
+        params = dict(self.params, context_adaptive_local=True)
+        model = ContextSubdNet(params).eval()
+        positions = self.inputs[:, :3]
+        half_flaps = self.half_flaps[0][0]
+
+        with torch.no_grad():
+            _, learned = model.context_block(
+                positions, half_flaps, return_scale_weights=True)
+            _, fixed_first = model.context_block(
+                positions, half_flaps, local_context_mode="fixed_1",
+                return_scale_weights=True)
+            _, fixed_last = model.context_block(
+                positions, half_flaps, local_context_mode="fixed_last",
+                return_scale_weights=True)
+
+        self.assertEqual(tuple(learned.shape), (positions.size(0), 2))
+        torch.testing.assert_close(
+            learned, torch.full_like(learned, 0.5), rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            learned.sum(dim=1), torch.ones(positions.size(0)),
+            rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            fixed_first[:, 0], torch.ones(positions.size(0)),
+            rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            fixed_last[:, 1], torch.ones(positions.size(0)),
+            rtol=0.0, atol=0.0)
+
+    def test_adaptive_model_preserves_common_seeded_initialization(self):
+        torch.manual_seed(14)
+        fixed = ContextSubdNet(self.params)
+        torch.manual_seed(14)
+        adaptive = ContextSubdNet(
+            dict(self.params, context_adaptive_local=True))
+        adaptive_state = adaptive.state_dict()
+        for name, value in fixed.state_dict().items():
+            torch.testing.assert_close(
+                value, adaptive_state[name], rtol=0.0, atol=0.0)
+
     def test_context_disabled_matches_original_core(self):
         torch.manual_seed(11)
         core = SubdNet(self.params).eval()
@@ -275,6 +338,9 @@ class ContextModelTests(unittest.TestCase):
         self.assertEqual(sum(p.numel() for p in core.parameters()), 15104)
         self.assertEqual(sum(p.numel() for p in context.parameters()), 313696)
 
+        adaptive = ContextSubdNet(dict(params, context_adaptive_local=True))
+        self.assertEqual(sum(p.numel() for p in adaptive.parameters()), 314759)
+
     def test_default_attention_depth_matches_first_configuration(self):
         params = make_params()
         del params["context_local_layers"]
@@ -309,6 +375,32 @@ class ContextModelTests(unittest.TestCase):
             torch.testing.assert_close(expected, moved_output,
                                        rtol=5e-5, atol=5e-5)
 
+    def test_adaptive_context_preserves_rigid_motion_behavior(self):
+        torch.manual_seed(20)
+        params = dict(self.params, context_adaptive_local=True)
+        model = ContextSubdNet(params).eval()
+        with torch.no_grad():
+            for predictor in (model.net_init, model.net_vertex, model.net_edge):
+                predictor.layerIn.weight[:, predictor.input_dim:].normal_(
+                    mean=0.0, std=0.02)
+
+            original = model(
+                self.inputs.clone(), 0, self.half_flaps,
+                self.pool_matrices, self.degrees)
+            rotation = fixed_rotation()
+            translation = torch.tensor([[0.6, -1.2, 2.3]])
+            moved_input = self.inputs.clone()
+            moved_input[:, :3] = moved_input[:, :3].mm(rotation.t()) + translation
+            moved_input[:, 3:] = moved_input[:, 3:].mm(rotation.t())
+            moved = model(
+                moved_input, 0, self.half_flaps,
+                self.pool_matrices, self.degrees)
+
+        for original_output, moved_output in zip(original, moved):
+            expected = original_output.mm(rotation.t()) + translation
+            torch.testing.assert_close(expected, moved_output,
+                                       rtol=5e-5, atol=5e-5)
+
     def test_rollout_shapes_context_history_and_gradients(self):
         torch.manual_seed(23)
         model = ContextSubdNet(self.params)
@@ -329,6 +421,33 @@ class ContextModelTests(unittest.TestCase):
 
         sum(output.square().mean() for output in outputs).backward()
         gradient = model.context_block.geometry_projection.weight.grad
+        self.assertIsNotNone(gradient)
+        self.assertGreater(float(gradient.abs().sum()), 0.0)
+
+    def test_adaptive_rollout_returns_weights_and_trains_selector(self):
+        torch.manual_seed(24)
+        params = dict(self.params, context_adaptive_local=True)
+        model = ContextSubdNet(params)
+        with torch.no_grad():
+            for predictor in (model.net_init, model.net_vertex, model.net_edge):
+                predictor.layerIn.weight[:, predictor.input_dim:].fill_(0.01)
+
+        outputs, selectors = model(
+            self.inputs.clone(), 0, self.half_flaps,
+            self.pool_matrices, self.degrees, return_selector_weights=True)
+        self.assertEqual(len(selectors), 2)
+        self.assertTrue(all(selector is not None for selector in selectors))
+        self.assertEqual(tuple(selectors[0].shape), (6, 2))
+        self.assertEqual(tuple(selectors[1].shape), (6, 2))
+        for selector in selectors:
+            self.assertTrue(torch.isfinite(selector).all())
+            self.assertTrue(bool((selector >= 0.0).all()))
+            torch.testing.assert_close(
+                selector.sum(dim=1), torch.ones(selector.size(0)),
+                rtol=1e-6, atol=1e-6)
+
+        sum(output.square().mean() for output in outputs).backward()
+        gradient = model.context_block.local_selector.scorer[-1].weight.grad
         self.assertIsNotNone(gradient)
         self.assertGreater(float(gradient.abs().sum()), 0.0)
 

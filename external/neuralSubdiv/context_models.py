@@ -312,13 +312,77 @@ class GlobalAttentionLayer(torch.nn.Module):
         return features
 
 
+class AdaptiveLocalContextSelector(torch.nn.Module):
+    """Softly mix cumulative local-attention depths for every vertex."""
+
+    def __init__(self, hidden_dim, scale_count, selector_hidden_dim=16):
+        super(AdaptiveLocalContextSelector, self).__init__()
+        if scale_count < 1:
+            raise ValueError("adaptive local context requires at least one scale")
+        if selector_hidden_dim < 1:
+            raise ValueError("selector hidden dimension must be positive")
+        self.scale_count = scale_count
+        self.scorer = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, selector_hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(selector_hidden_dim, 1),
+        )
+        self.scale_bias = torch.nn.Parameter(torch.zeros(scale_count))
+
+        # Start from an unbiased mixture instead of preferring a depth at random.
+        torch.nn.init.zeros_(self.scorer[-1].weight)
+        torch.nn.init.zeros_(self.scorer[-1].bias)
+
+    def _fixed_weights(self, stacked, radius):
+        if radius < 1 or radius > self.scale_count:
+            raise ValueError(
+                "fixed local-context radius must be between 1 and %d" %
+                self.scale_count)
+        weights = stacked.new_zeros((stacked.size(0), self.scale_count))
+        weights[:, radius - 1] = 1.0
+        return weights
+
+    def forward(self, intermediate_features, mode="learned"):
+        if len(intermediate_features) != self.scale_count:
+            raise ValueError(
+                "expected %d cumulative local scales, received %d" %
+                (self.scale_count, len(intermediate_features)))
+        stacked = torch.stack(intermediate_features, dim=1)
+
+        if mode == "learned":
+            logits = self.scorer(stacked).squeeze(-1) + self.scale_bias
+            weights = torch.softmax(logits, dim=1)
+        elif mode == "uniform":
+            weights = stacked.new_full(
+                (stacked.size(0), self.scale_count),
+                1.0 / float(self.scale_count))
+        elif mode == "fixed_last":
+            weights = self._fixed_weights(stacked, self.scale_count)
+        elif mode.startswith("fixed_"):
+            try:
+                radius = int(mode.split("_", 1)[1])
+            except ValueError:
+                raise ValueError("invalid local-context mode: %s" % mode)
+            weights = self._fixed_weights(stacked, radius)
+        else:
+            raise ValueError("invalid local-context mode: %s" % mode)
+
+        mixed = (stacked * weights.unsqueeze(-1)).sum(dim=1)
+        return mixed, weights
+
+
 class MeshContextBlock(torch.nn.Module):
     """Produce one invariant contextual embedding per mesh vertex."""
 
     def __init__(self, latent_dim, hidden_dim=64, heads=4, local_layers=6,
                  global_layers=2, feed_forward_dim=128, dropout=0.0,
-                 global_chunk_size=256, eps=1e-8):
+                 global_chunk_size=256, eps=1e-8, adaptive_local=False,
+                 selector_hidden_dim=16):
         super(MeshContextBlock, self).__init__()
+        if adaptive_local and local_layers < 1:
+            raise ValueError(
+                "adaptive local context requires at least one local layer")
+        self.adaptive_local = False
         self.geometry = InvariantVertexGeometry(eps=eps)
         self.geometry_projection = torch.nn.Linear(
             self.geometry.feature_dim, hidden_dim)
@@ -337,8 +401,23 @@ class MeshContextBlock(torch.nn.Module):
             for _ in range(global_layers)
         ])
         self.output_norm = torch.nn.LayerNorm(hidden_dim)
+        self.local_selector = None
+        if adaptive_local:
+            self.enable_adaptive_local(selector_hidden_dim)
 
-    def forward(self, positions, half_flaps, invariant_latent=None):
+    def enable_adaptive_local(self, selector_hidden_dim=16):
+        if not self.local_layers:
+            raise ValueError(
+                "adaptive local context requires at least one local layer")
+        if self.local_selector is not None:
+            raise RuntimeError("adaptive local selector is already enabled")
+        hidden_dim = self.geometry_projection.out_features
+        self.local_selector = AdaptiveLocalContextSelector(
+            hidden_dim, len(self.local_layers), selector_hidden_dim)
+        self.adaptive_local = True
+
+    def forward(self, positions, half_flaps, invariant_latent=None,
+                local_context_mode="learned", return_scale_weights=False):
         geometry, local_scale, global_scale, radial_distance = self.geometry(
             positions, half_flaps)
         features = self.geometry_projection(geometry)
@@ -348,13 +427,28 @@ class MeshContextBlock(torch.nn.Module):
             features = features + self.latent_projection(invariant_latent)
         features = self.input_norm(features)
 
+        local_history = []
         for layer in self.local_layers:
             features = layer(features, positions, half_flaps, local_scale,
                              radial_distance)
+            local_history.append(features)
+
+        scale_weights = None
+        if self.local_selector is not None:
+            features, scale_weights = self.local_selector(
+                local_history, mode=local_context_mode)
+        elif local_context_mode != "learned":
+            raise ValueError(
+                "local-context mode %s requires an adaptive model" %
+                local_context_mode)
+
         for layer in self.global_layers:
             features = layer(features, positions, half_flaps, global_scale,
                              radial_distance)
-        return self.output_norm(features)
+        features = self.output_norm(features)
+        if return_scale_weights:
+            return features, scale_weights
+        return features
 
 
 class HalfFlapContextProjection(torch.nn.Module):
@@ -454,6 +548,9 @@ class ContextSubdNet(SubdNet):
         self.net_edge = ContextConditionedMLP.from_core(core_edge, context_dim)
         self.net_vertex = ContextConditionedMLP.from_core(core_vertex, context_dim)
 
+        adaptive_local = bool(params.get("context_adaptive_local", False))
+        selector_hidden_dim = int(
+            params.get("context_selector_hidden_dim", 16))
         self.context_block = MeshContextBlock(
             latent_dim=latent_dim,
             hidden_dim=hidden_dim,
@@ -464,8 +561,14 @@ class ContextSubdNet(SubdNet):
             dropout=float(params.get("context_dropout", 0.0)),
             global_chunk_size=int(params.get("context_global_chunk_size", 256)),
             eps=float(params.get("context_geometry_eps", 1e-8)),
+            adaptive_local=False,
         )
-        self.context_projection = HalfFlapContextProjection(hidden_dim, context_dim)
+        # Create the legacy projection before the optional selector so every
+        # shared parameter keeps the fixed-model initialization for one seed.
+        self.context_projection = HalfFlapContextProjection(
+            hidden_dim, context_dim)
+        if adaptive_local:
+            self.context_block.enable_adaptive_local(selector_hidden_dim)
 
     def copy_core_weights(self, core_model):
         self.net_init.copy_core_weights(core_model.net_init)
@@ -483,29 +586,54 @@ class ContextSubdNet(SubdNet):
         self.net_vertex.zero_context_weights()
 
     def _compute_half_flap_context(self, vertex_features, half_flaps,
-                                   use_learned_features, shuffle_context):
+                                   use_learned_features, shuffle_context,
+                                   local_context_mode="learned",
+                                   return_scale_weights=False):
         invariant_latent = None
         if use_learned_features and vertex_features.size(1) > 3:
             invariant_latent = vertex_features[:, 3:]
-        vertex_context = self.context_block(
-            vertex_features[:, :3], half_flaps, invariant_latent)
+        context_result = self.context_block(
+            vertex_features[:, :3], half_flaps, invariant_latent,
+            local_context_mode=local_context_mode,
+            return_scale_weights=return_scale_weights)
+        if return_scale_weights:
+            vertex_context, scale_weights = context_result
+        else:
+            vertex_context = context_result
+            scale_weights = None
         if shuffle_context:
             permutation = torch.randperm(
                 vertex_context.size(0), device=vertex_context.device)
             vertex_context = vertex_context[permutation]
-        return self.context_projection(vertex_context, half_flaps)
+            if scale_weights is not None:
+                scale_weights = scale_weights[permutation]
+        half_flap_context = self.context_projection(vertex_context, half_flaps)
+        if return_scale_weights:
+            return half_flap_context, scale_weights
+        return half_flap_context
 
     def forward(self, fv, mIdx, HFs, poolMats, DOFs, context_enabled=True,
-                shuffle_context=False, return_context=False):
+                shuffle_context=False, return_context=False,
+                local_context_mode="learned", return_selector_weights=False):
         outputs = []
         context_history = []
+        selector_history = []
 
         initial_half_flaps = HFs[mIdx][0]
         initial_context = None
         if context_enabled:
-            initial_context = self._compute_half_flap_context(
+            initial_result = self._compute_half_flap_context(
                 fv, initial_half_flaps, use_learned_features=False,
-                shuffle_context=shuffle_context)
+                shuffle_context=shuffle_context,
+                local_context_mode=local_context_mode,
+                return_scale_weights=return_selector_weights)
+            if return_selector_weights:
+                initial_context, initial_selector = initial_result
+                selector_history.append(initial_selector)
+            else:
+                initial_context = initial_result
+        elif return_selector_weights:
+            selector_history.append(None)
         context_history.append(initial_context)
 
         fv_input_pos = fv[:, :3]
@@ -520,9 +648,18 @@ class ContextSubdNet(SubdNet):
             half_flaps = HFs[mIdx][level]
             transition_context = None
             if context_enabled:
-                transition_context = self._compute_half_flap_context(
+                transition_result = self._compute_half_flap_context(
                     fv, half_flaps, use_learned_features=True,
-                    shuffle_context=shuffle_context)
+                    shuffle_context=shuffle_context,
+                    local_context_mode=local_context_mode,
+                    return_scale_weights=return_selector_weights)
+                if return_selector_weights:
+                    transition_context, transition_selector = transition_result
+                    selector_history.append(transition_selector)
+                else:
+                    transition_context = transition_result
+            elif return_selector_weights:
+                selector_history.append(None)
             context_history.append(transition_context)
 
             previous_position = fv[:, :3]
@@ -544,12 +681,17 @@ class ContextSubdNet(SubdNet):
             fv = torch.cat((fv_even, fv_odd), dim=0)
             outputs.append(fv[:, :3])
 
+        if return_context and return_selector_weights:
+            return outputs, context_history, selector_history
         if return_context:
             return outputs, context_history
+        if return_selector_weights:
+            return outputs, selector_history
         return outputs
 
 
 __all__ = [
+    "AdaptiveLocalContextSelector",
     "ContextConditionedMLP",
     "ContextSubdNet",
     "GlobalAttentionLayer",
