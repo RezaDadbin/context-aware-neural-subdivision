@@ -1,78 +1,50 @@
 # Context-Aware Neural Subdivision
 
-Research implementation of a context-conditioned extension to Neural
-Subdivision. The released Initialization, Vertex, and Edge (I/V/E) subdivision
-core is preserved, while a deterministic Context Block supplies wider
-topology-local and whole-mesh information to each predictor.
+## Overview
 
-This repository contains source code and reproducibility tooling. Datasets,
-source meshes, trained checkpoints, logs, renders, and report files are not
-included.
+Research implementation built around [Neural Subdivision](https://www.dgp.toronto.edu/projects/neural-subdivision/) for learning-based triangular-mesh refinement. The project includes a reproduced baseline pipeline and an implemented, experimentally evaluated research extension. Further research is ongoing.
 
-## Architecture
+The public documentation focuses on implementation and reproducibility infrastructure:
 
-The Context Block:
+- Randomized mesh preprocessing and coarse/fine hierarchy generation.
+- Topology, correspondence, and dataset validation before training.
+- Python/PyTorch training, checkpoint/resume, and experiment management.
+- Held-out evaluation, mesh-quality checks, and rendering tools.
+- Baseline parity, rigid-motion/invariance, topology, and metric tests.
 
-1. computes rigid-motion-invariant scalar features on the current mesh;
-2. applies six topology-restricted local-attention layers;
-3. applies two chunked whole-mesh attention layers;
-4. projects the four contextual half-flap embeddings into a 64-dimensional
-   conditioning vector; and
-5. concatenates that vector with the original canonical half-flap descriptor
-   before the I/V/E predictors.
+Datasets, source meshes, trained checkpoints, logs, renders, and report files are not included. Details of ongoing unreleased research are intentionally omitted from the public documentation.
 
-Context and subdivision parameters are optimized jointly. Connectivity,
-canonical local frames, local-to-global conversion, aggregation, and vertex
-ordering remain part of the original subdivision core.
-
-An optional Adaptive V1 selector learns a soft per-vertex mixture of the
-cumulative outputs from the six local-attention layers. Enable it with
-`--adaptive-local`; the fixed final-depth model remains the default.
-
-## Repository Layout
+## Repository Structure
 
 ```text
 configs/                         dataset-neutral model configuration
-docs/                            architecture and reproduction notes
-external/neuralSubdiv/           preserved core and context implementation
+docs/                            scope, attribution, and reproduction notes
+external/neuralSubdiv/           upstream-derived research implementation
 external/surface_multigrid_code/ C++ subdivision/remeshing generator source
-scripts/                         generation, training, evaluation, and rendering
-tests/                           parity, invariance, topology, and metric tests
+scripts/                         data generation, training, evaluation, rendering
+tests/                           structural, invariance, parity, and metric tests
 ```
 
-The main implementation files are:
-
-```text
-external/neuralSubdiv/context_models.py
-external/neuralSubdiv/train_context.py
-external/neuralSubdiv/test_context.py
-external/neuralSubdiv/evaluate_model.py
-external/neuralSubdiv/validate_dataset.py
-external/neuralSubdiv/validate_generated_chain.py
-external/neuralSubdiv/train_resume.py
-```
+For the contribution boundary, see [Changes from upstream](docs/changes_from_upstream.md). For data and checkpoint expectations, see [Reproduction notes](docs/reproduction_notes.md).
 
 ## Installation
 
-Python 3.11 was used for the reported experiments.
+Use Python 3.11 and a virtual environment. Building the data generator also requires CMake and a C++ compiler.
 
 ```bash
+git clone https://github.com/RezaDadbin/context-aware-neural-subdivision.git
+cd context-aware-neural-subdivision
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install --upgrade pip
 python3 -m pip install -r requirements.txt
 ```
 
-Run the source-only test suite:
-
-```bash
-python3 -m unittest discover -s tests -v
-```
+On Windows, activate the environment with `.venv\Scripts\activate`; the shell launchers require a Bash-compatible environment. Select a PyTorch build appropriate for your hardware when preparing the environment.
 
 ## Data Preparation
 
-The experiment scripts expect legally obtained, closed triangular source meshes
-at the following paths:
+The supplied generation workflow expects legally obtained, closed triangular source meshes at:
 
 ```text
 data_candidates/compact_context/01_bimba_head.obj
@@ -80,74 +52,68 @@ data_candidates/compact_context/02_fat_dragon.obj
 data_candidates/compact_context/03_gear16.obj
 ```
 
-The mesh files are intentionally excluded because redistribution rights depend
-on their original datasets. Substitute other compatible meshes by updating the
-paths in `scripts/generate_all_context_datasets.sh`.
+Source meshes are excluded because redistribution rights depend on their original datasets. To use other compatible meshes, update the source paths in `scripts/generate_all_context_datasets.sh`.
 
-Build the C++ generator:
+From the repository root:
 
 ```bash
 ./scripts/build_cxx_generator.sh
-```
-
-The first CMake configuration may download third-party build dependencies.
-Then generate and validate all configured splits:
-
-```bash
 ./scripts/generate_all_context_datasets.sh
 ```
 
-Each accepted chain follows `500 -> 2,000 -> 8,000` faces. The generator keeps
-sampling seeds until the requested train, validation, and held-out splits pass
-the topology, correspondence, finite-value, and core-frame checks.
+The first CMake configuration may download third-party build dependencies. Generation produces randomized coarse/fine chains and checks topology, correspondence, finite values, and local-frame validity before creating training, validation, and held-out PKL splits. See [Reproduction notes](docs/reproduction_notes.md) for the supplied data layout.
 
 ## Training
 
-Create one context job explicitly:
+Create an experiment using your generated datasets. Replace the paths below with absolute paths to your PKL files:
 
 ```bash
 python3 scripts/write_context_hyperparams.py EXPERIMENT_NAME \
   --train-pkl /path/to/train.pkl \
-  --valid-pkl /path/to/valid.pkl \
-  --adaptive-local
+  --valid-pkl /path/to/valid.pkl
 ./scripts/train_context.sh EXPERIMENT_NAME
 ```
 
-The project-specific six-model runner is also retained:
-
-```bash
-PYTHON_BIN=python3 ./scripts/train_all_six_models_700.sh
-```
-
-Training saves a resumable checkpoint after each completed epoch and retains
-the lowest-validation-loss weights in `netparams.dat`.
+The job is written under `external/neuralSubdiv/jobs/net_context_EXPERIMENT_NAME/`. Training saves a resumable checkpoint after each completed epoch and retains the lowest-validation-loss model in `netparams.dat`. Rerun the same launcher to resume an interrupted job with compatible data and settings.
 
 ## Evaluation
 
-Evaluate a context-conditioned checkpoint:
+After training, evaluate the saved model on a separate held-out split:
 
 ```bash
 cd external/neuralSubdiv
 python3 evaluate_model.py /path/to/job /path/to/held_out.pkl \
-  --model context \
-  --modes context disabled shuffled uniform fixed_1 fixed_6 \
-  --selector-output /path/to/selector_weights.npz
+  --model context --modes context
 ```
 
-The intervention modes test whether the trained model depends on correctly
-aligned context. See `docs/context_block.md` for implementation details and
-`docs/reproduction_notes.md` for artifact and dataset expectations.
+The evaluator provides correspondence, surface-distance, normal, topology, mesh-quality, and rigid-motion checks. Evaluation requires local datasets and a trained checkpoint; neither is bundled. No unpublished quantitative results are reported here.
 
-## Scope
+## Testing
 
-The current experiments use one object-specific model per source mesh. They
-evaluate object-specific structural context and do not establish cross-object
-semantic generalization. The proposed stochastic Generative Block is not
-implemented in this repository.
+From the repository root, with the Python dependencies installed:
 
-## Attribution and License
+```bash
+python3 -m unittest discover -s tests -v
+```
 
-This work modifies and extends the released Neural Subdivision implementation
-and uses the linked Surface Multigrid subdivision/remeshing code. Upstream
-licenses are preserved in their respective directories. See
-`THIRD_PARTY_NOTICES.md` and `docs/changes_from_upstream.md`.
+The tests cover structural behavior, baseline compatibility, rigid-motion/invariance, topology, finite gradients, and metric calculations. They do not require the excluded research datasets or trained checkpoints.
+
+## Reproducibility
+
+Record the repository commit, Python/package versions, hardware/device, source-mesh provenance, dataset splits, random seed, and experiment configuration. Keep generated data, checkpoints, logs, and evaluation outputs together outside the tracked source tree.
+
+The training infrastructure records run identity and random-number-generator state for resume checks. Reproducibility still depends on compatible data, software, and hardware; identical seeds do not guarantee identical results across platforms.
+
+## Attribution / Third-Party Code
+
+The original **Neural Subdivision** method and released implementation are by Hsueh-Ti Derek Liu, Vladimir G. Kim, Siddhartha Chaudhuri, Noam Aigerman, and Alec Jacobson (SIGGRAPH 2020). This repository reproduces and extends their work; it does not claim authorship of the original method.
+
+- [Neural Subdivision paper/project](https://www.dgp.toronto.edu/projects/neural-subdivision/) and [upstream code](https://github.com/HTDerekLiu/neuralSubdiv).
+- [Surface Multigrid subdivision/remeshing code](https://github.com/HTDerekLiu/surface_multigrid_code), used for data generation.
+- [Third-party notices](THIRD_PARTY_NOTICES.md), including upstream reference revisions and license locations.
+
+Original license files and upstream README files are preserved under `external/`.
+
+## Research Status / Scope
+
+Baseline reproduction is complete; a research extension has been implemented and experimentally evaluated. Further research is ongoing. Current workflows train separate models per source mesh and do not establish cross-object semantic generalization. This documentation describes the research problem, implemented infrastructure, and status without specifying unpublished mechanisms or future architectures.

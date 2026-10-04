@@ -10,8 +10,10 @@ projects. Their original license files are retained with the source.
 - Reference revision: `fa64a7384cd375b4c26cedf3f1b86ac2f5ab2e16`
 - License: Mozilla Public License 2.0
 
-The Context Block, resumable training path, validation, evaluation, and MPS
-compatibility changes are documented in `docs/changes_from_upstream.md`.
+The research extension, resumable training, validation, evaluation, and MPS
+compatibility contributions are summarized in [changes from upstream](docs/changes_from_upstream.md).
+The original Neural Subdivision method and core implementation are attributed
+to their upstream authors; see the [paper/project page](https://www.dgp.toronto.edu/projects/neural-subdivision/).
 
 ## Surface Multigrid via Intrinsic Prolongation
 
